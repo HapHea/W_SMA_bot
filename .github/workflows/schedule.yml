@@ -1,0 +1,32 @@
+name: Weekly Stock Screener
+
+on:
+  schedule:
+    # 매주 토요일 오전 9시 (한국시간 기준) = UTC 기준 토요일 0시
+    - cron: '0 0 * * 6'
+  workflow_dispatch: # 버튼을 눌러 수동으로 실행할 수 있게 해주는 옵션
+
+jobs:
+  run-screener:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install yfinance finance-datareader pandas requests
+
+    - name: Run Python script
+      env:
+        # GitHub Secrets에 등록한 토큰과 챗아이디를 불러옵니다.
+        TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      run: python main.py
