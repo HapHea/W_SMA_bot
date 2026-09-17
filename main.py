@@ -1,10 +1,18 @@
+import os
+import sys
+
+# 🚀 1. 스크립트 실행 시 yfinance 강제 업데이트 (Cookie/crumb 오류 완벽 차단)
+print("🔄 yfinance 패키지를 최신 버전으로 업데이트하는 중...")
+os.system(f"{sys.executable} -m pip install --upgrade yfinance --quiet")
+
 import yfinance as yf
 import FinanceDataReader as fdr
 import pandas as pd
 import requests
 import datetime
-import os
 import warnings
+import time
+import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -18,9 +26,9 @@ CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '1729501017')
 
 # --- 통신 안정성 및 동시성 처리를 위한 세션 설정 ---
 session = requests.Session()
+# 🚀 2. 서버 부하를 줄이기 위해 Connection Pool 사이즈를 50 -> 10으로 축소
 retry = Retry(connect=5, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
-# 병렬 처리(max_workers=50)에 맞춰 Pool Size를 50으로 대폭 확장
-adapter = HTTPAdapter(max_retries=retry, pool_connections=50, pool_maxsize=50)
+adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
 session.mount('http://', adapter)
 session.mount('https://', adapter)
 
@@ -46,13 +54,11 @@ def send_telegram_message(message):
 def check_ma_logic(df_ticker):
     """(로컬 연산) 주봉 10, 20, 60 정배열 2주 내 진입 여부 판별"""
     try:
-        # 일봉 데이터를 주봉(금요일 기준)으로 변환
         df_weekly = df_ticker.resample('W-FRI').agg({'Close': 'last'}).dropna()
 
         if len(df_weekly) < 3:
             return False
 
-        # 주봉 이동평균선 계산
         df_weekly['MA10'] = df_weekly['Close'].rolling(window=10).mean()
         df_weekly['MA20'] = df_weekly['Close'].rolling(window=20).mean()
         df_weekly['MA60'] = df_weekly['Close'].rolling(window=60).mean()
@@ -61,7 +67,6 @@ def check_ma_logic(df_ticker):
         prev_1w = df_weekly.iloc[-2]
         prev_2w = df_weekly.iloc[-3]
 
-        # 3주치 데이터 중 하나라도 이평선(MA60)이 NaN이면 False
         if pd.isna(current['MA60']) or pd.isna(prev_1w['MA60']) or pd.isna(prev_2w['MA60']):
             return False
 
@@ -69,12 +74,10 @@ def check_ma_logic(df_ticker):
         p1_10, p1_20, p1_60 = prev_1w['MA10'], prev_1w['MA20'], prev_1w['MA60']
         p2_10, p2_20, p2_60 = prev_2w['MA10'], prev_2w['MA20'], prev_2w['MA60']
 
-        # 조건 판별
         current_aligned = (c_10 > c_20 > c_60)
         prev_1w_aligned = (p1_10 > p1_20 > p1_60)
         prev_2w_aligned = (p2_10 > p2_20 > p2_60)
 
-        # 2주 이내에 정배열로 전환(초기 진입)된 종목 필터링
         if current_aligned and (not prev_1w_aligned or not prev_2w_aligned):
             return True
 
@@ -83,9 +86,6 @@ def check_ma_logic(df_ticker):
         return False
 
 
-# ==========================================
-# 🇰🇷 한국 주식/ETF 처리 로직 (FDR 병렬 처리)
-# ==========================================
 def process_kr_asset(ticker, name):
     """한국 종목 개별 다운로드 및 이평선 검사"""
     try:
@@ -105,11 +105,9 @@ def process_kr_asset(ticker, name):
     return None
 
 
-def run_kr_concurrent(items, max_workers=50):
-    """한국 주식/ETF 다중 처리 (Code/Symbol 컬럼명 동적 대응)"""
+def run_kr_concurrent(items, max_workers=10):
+    """한국 주식/ETF 다중 처리 (429 차단 위험이 적어 10 유지)"""
     aligned_list = []
-
-    # 데이터프레임에 'Code' 컬럼이 있으면 'Code'를, 없으면 'Symbol'을 사용
     ticker_col = 'Code' if 'Code' in items.columns else 'Symbol'
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -122,12 +120,12 @@ def run_kr_concurrent(items, max_workers=50):
     return aligned_list
 
 
-# ==========================================
-# 🇺🇸 미국 주식/ETF 처리 로직 (배치 다운로드 + 필터링 역전)
-# ==========================================
 def check_us_market_cap(ticker, name, asset_type):
     """정배열을 통과한 종목에 한하여 API를 통해 시가총액/AUM 검사"""
     try:
+        # 🚀 3. 개별 종목 정보 요청 시 차단을 막기 위해 0.5~1.5초 랜덤 휴식 부여
+        time.sleep(random.uniform(0.5, 1.5))
+        
         ticker_obj = yf.Ticker(ticker, session=session)
         if asset_type == 'STOCK':
             cap = ticker_obj.fast_info.get('market_cap', 0)
@@ -141,23 +139,24 @@ def check_us_market_cap(ticker, name, asset_type):
     return None
 
 
-def process_us_batch(items, asset_type, chunk_size=500, max_workers=50):
+# 🚀 4. 한 번에 다운로드하는 종목(chunk_size)을 100으로 줄이고 동시 실행(max_workers)을 5로 제한
+def process_us_batch(items, asset_type, chunk_size=100, max_workers=5):
     """미국 종목: 대량 다운로드 -> 이평선 검사 -> 통과 종목만 시가총액 검사"""
     passed_ma_tickers = []
     symbol_name_map = dict(zip(items['Symbol'], items['Name']))
     symbols = list(items['Symbol'].unique())
 
-    # 1. Chunk 단위로 대량 다운로드 및 빠른 정배열 검사
     for i in range(0, len(symbols), chunk_size):
         chunk = symbols[i:i + chunk_size]
         print(f"   📥 데이터 다운로드 및 분석 중... ({i + 1} ~ {min(i + chunk_size, len(symbols))} / {len(symbols)})")
 
+        # 🚀 5. 대량 다운로드 요청 전 2초간 강제 휴식 (DDoS로 인식되는 것 방지)
+        time.sleep(2)
         df_all = yf.download(chunk, period='2y', progress=False, session=session)
 
         if df_all.empty:
             continue
 
-        # 다중 종목일 경우 MultiIndex 반환, 단일 종목일 경우 일반 Index 반환 처리
         if isinstance(df_all.columns, pd.MultiIndex):
             if 'Close' not in df_all.columns.levels[0]:
                 continue
@@ -181,7 +180,6 @@ def process_us_batch(items, asset_type, chunk_size=500, max_workers=50):
 
     print(f"   🎯 정배열 통과 종목 ({len(passed_ma_tickers)}개). 시가총액/AUM 필터링 시작...")
 
-    # 2. 정배열 조건을 통과한 소수의 종목만 시가총액 검사 (병렬 처리)
     final_list = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [
@@ -196,55 +194,37 @@ def process_us_batch(items, asset_type, chunk_size=500, max_workers=50):
     return final_list
 
 
-# ==========================================
-# 🚀 Main 실행
-# ==========================================
 def main():
     print("🚀 주봉 정배열(2주 이내 진입) 조건 검색 시작...")
 
-    # ----------------------------------------
-    # 1. 한국 주식 (KOSPI, KOSDAQ / 시가총액 4000억 이상)
-    # ----------------------------------------
     print("🇰🇷 국내 주식 (KOSPI & KOSDAQ) 검색 중...")
     krx = fdr.StockListing('KRX')
     kr_stocks_filtered = krx[
         (krx['Market'].isin(['KOSPI', 'KOSDAQ'])) &
-        (krx['Marcap'] >= 400_000_000_000)  # 로컬 데이터로 미리 필터링
+        (krx['Marcap'] >= 400_000_000_000) 
         ]
-    kr_aligned_stocks = run_kr_concurrent(kr_stocks_filtered, max_workers=50)
+    kr_aligned_stocks = run_kr_concurrent(kr_stocks_filtered, max_workers=10)
 
-    # ----------------------------------------
-    # 2. 한국 주식 ETF
-    # ----------------------------------------
     print("🇰🇷 국내 ETF 검색 중...")
     kr_etfs = fdr.StockListing('ETF/KR')
-    kr_aligned_etfs = run_kr_concurrent(kr_etfs, max_workers=50)
+    kr_aligned_etfs = run_kr_concurrent(kr_etfs, max_workers=10)
 
-    # ----------------------------------------
-    # 3. 미국 주식 (S&P 500, NASDAQ / 시가총액 250억 달러 이상)
-    # ----------------------------------------
     print("🇺🇸 미국 주식 (S&P 500 & NASDAQ) 검색 중...")
     sp500 = fdr.StockListing('S&P500')
     nasdaq = fdr.StockListing('NASDAQ')
     us_stocks = pd.concat([sp500, nasdaq]).drop_duplicates(subset='Symbol')
-    us_aligned_stocks = process_us_batch(us_stocks, asset_type='STOCK', chunk_size=500, max_workers=50)
+    us_aligned_stocks = process_us_batch(us_stocks, asset_type='STOCK', chunk_size=100, max_workers=5)
 
-    # ----------------------------------------
-    # 4. 미국 주식 ETF (운용자산 250억 달러 이상)
-    # ----------------------------------------
     print("🇺🇸 미국 ETF 검색 중...")
     try:
         us_etfs = fdr.StockListing('ETF/US')
         if us_etfs.empty:
             raise ValueError("미국 ETF 리스트가 비어 있습니다.")
-        us_aligned_etfs = process_us_batch(us_etfs, asset_type='ETF', chunk_size=500, max_workers=50)
+        us_aligned_etfs = process_us_batch(us_etfs, asset_type='ETF', chunk_size=100, max_workers=5)
     except Exception as e:
         print(f"⚠ 미국 ETF 리스트 로드 실패: {e}")
         us_aligned_etfs = []
 
-    # ----------------------------------------
-    # 5. 텔레그램 메시지 조립 및 전송
-    # ----------------------------------------
     message = "📈 **주간 10/20/60 정배열 포착 리포트 (최근 2주 내 진입)**\n\n"
 
     message += "🇰🇷 **국내 주식 (시총 4천억 이상)**\n"
