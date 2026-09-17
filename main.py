@@ -1,7 +1,7 @@
 import os
 import sys
 
-# 🚀 1. 스크립트 실행 시 yfinance 강제 업데이트 (Cookie/crumb 오류 완벽 차단)
+# 🚀 1. 스크립트 실행 시 yfinance 강제 업데이트
 print("🔄 yfinance 패키지를 최신 버전으로 업데이트하는 중...")
 os.system(f"{sys.executable} -m pip install --upgrade yfinance --quiet")
 
@@ -24,11 +24,13 @@ warnings.filterwarnings('ignore')
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '8383235460:AAFAdBAFy5dUQE1wqkShqF3X8T9FbIaUJQc')
 CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '1729501017')
 
-# --- 통신 안정성 및 동시성 처리를 위한 세션 설정 ---
+# --- 통신 안정성 및 차단 방지 세션 설정 (User-Agent 추가) ---
 session = requests.Session()
-# 🚀 2. 서버 부하를 줄이기 위해 Connection Pool 사이즈를 50 -> 10으로 축소
-retry = Retry(connect=5, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
-adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
+session.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+})
+retry = Retry(connect=5, backoff_factor=1.0, status_forcelist=[429, 500, 502, 503, 504])
+adapter = HTTPAdapter(max_retries=retry, pool_connections=5, pool_maxsize=5)
 session.mount('http://', adapter)
 session.mount('https://', adapter)
 
@@ -106,7 +108,7 @@ def process_kr_asset(ticker, name):
 
 
 def run_kr_concurrent(items, max_workers=10):
-    """한국 주식/ETF 다중 처리 (429 차단 위험이 적어 10 유지)"""
+    """한국 주식/ETF 다중 처리"""
     aligned_list = []
     ticker_col = 'Code' if 'Code' in items.columns else 'Symbol'
 
@@ -120,11 +122,30 @@ def run_kr_concurrent(items, max_workers=10):
     return aligned_list
 
 
+def get_filtered_kr_etfs(min_marcap_100m=4000):
+    """시가총액 4천억 이상 국내 ETF만 가져오기"""
+    try:
+        url = "https://finance.naver.com/api/sise/etfItemList.nhn"
+        response = session.get(url, timeout=10)
+        data = response.json()
+        
+        etf_list = data['result']['etfItemList']
+        df = pd.DataFrame(etf_list)
+        
+        df_filtered = df[df['marketSum'] >= min_marcap_100m]
+        df_filtered = df_filtered.rename(columns={'itemcode': 'Symbol', 'itemname': 'Name'})
+        
+        print(f"    ✓ 전체 ETF 중 {len(df_filtered)}개가 4000억 이상 조건 충족")
+        return df_filtered[['Symbol', 'Name']]
+    except Exception as e:
+        print(f"⚠ 국내 ETF 목록 로드 실패: {e}")
+        return pd.DataFrame(columns=['Symbol', 'Name'])
+
+
 def check_us_market_cap(ticker, name, asset_type):
     """정배열을 통과한 종목에 한하여 API를 통해 시가총액/AUM 검사"""
     try:
-        # 🚀 3. 개별 종목 정보 요청 시 차단을 막기 위해 0.5~1.5초 랜덤 휴식 부여
-        time.sleep(random.uniform(0.5, 1.5))
+        time.sleep(random.uniform(0.5, 1.0))
         
         ticker_obj = yf.Ticker(ticker, session=session)
         if asset_type == 'STOCK':
@@ -139,20 +160,18 @@ def check_us_market_cap(ticker, name, asset_type):
     return None
 
 
-# 🚀 4. 한 번에 다운로드하는 종목(chunk_size)을 100으로 줄이고 동시 실행(max_workers)을 5로 제한
-def process_us_batch(items, asset_type, chunk_size=100, max_workers=5):
-    """미국 종목: 대량 다운로드 -> 이평선 검사 -> 통과 종목만 시가총액 검사"""
+def process_us_batch(items, asset_type, chunk_size=50, max_workers=2):
+    """미국 종목: 대량 다운로드 (threads=False로 429 차단 방지) -> 이평선 검사 -> 시가총액 검사"""
     passed_ma_tickers = []
     symbol_name_map = dict(zip(items['Symbol'], items['Name']))
     symbols = list(items['Symbol'].unique())
 
     for i in range(0, len(symbols), chunk_size):
         chunk = symbols[i:i + chunk_size]
-        print(f"   📥 데이터 다운로드 및 분석 중... ({i + 1} ~ {min(i + chunk_size, len(symbols))} / {len(symbols)})")
+        print(f"    📥 데이터 다운로드 및 분석 중... ({i + 1} ~ {min(i + chunk_size, len(symbols))} / {len(symbols)})")
 
-        # 🚀 5. 대량 다운로드 요청 전 2초간 강제 휴식 (DDoS로 인식되는 것 방지)
-        time.sleep(2)
-        df_all = yf.download(chunk, period='2y', progress=False, session=session)
+        time.sleep(2) # 서버 부하 방지용 대기
+        df_all = yf.download(chunk, period='2y', progress=False, session=session, threads=False)
 
         if df_all.empty:
             continue
@@ -178,7 +197,7 @@ def process_us_batch(items, asset_type, chunk_size=100, max_workers=5):
                 if len(df_ticker) >= 300 and check_ma_logic(df_ticker):
                     passed_ma_tickers.append(chunk[0])
 
-    print(f"   🎯 정배열 통과 종목 ({len(passed_ma_tickers)}개). 시가총액/AUM 필터링 시작...")
+    print(f"    🎯 정배열 통과 종목 ({len(passed_ma_tickers)}개). 시가총액/AUM 필터링 시작...")
 
     final_list = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -205,22 +224,31 @@ def main():
         ]
     kr_aligned_stocks = run_kr_concurrent(kr_stocks_filtered, max_workers=10)
 
-    print("🇰🇷 국내 ETF 검색 중...")
-    kr_etfs = fdr.StockListing('ETF/KR')
-    kr_aligned_etfs = run_kr_concurrent(kr_etfs, max_workers=10)
+    print("🇰🇷 국내 ETF 검색 중 (시가총액 4000억 이상)...")
+    kr_etfs_filtered = get_filtered_kr_etfs(4000)
+    if not kr_etfs_filtered.empty:
+        kr_aligned_etfs = run_kr_concurrent(kr_etfs_filtered, max_workers=10)
+    else:
+        kr_aligned_etfs = []
 
-    print("🇺🇸 미국 주식 (S&P 500 & NASDAQ) 검색 중...")
+    print("🇺🇸 미국 주식 (S&P 500 전체 및 NASDAQ 상위 500개) 검색 중...")
     sp500 = fdr.StockListing('S&P500')
     nasdaq = fdr.StockListing('NASDAQ')
-    us_stocks = pd.concat([sp500, nasdaq]).drop_duplicates(subset='Symbol')
-    us_aligned_stocks = process_us_batch(us_stocks, asset_type='STOCK', chunk_size=100, max_workers=5)
+    
+    # 나스닥은 시가총액 정보가 있는 경우 정렬 후 상위 500개 추출 (없으면 상위 500개 슬라이스)
+    if 'Marcap' in nasdaq.columns:
+        nasdaq = nasdaq.sort_values(by='Marcap', ascending=False)
+    nasdaq_top500 = nasdaq.head(500)
+
+    us_stocks = pd.concat([sp500, nasdaq_top500]).drop_duplicates(subset='Symbol')
+    us_aligned_stocks = process_us_batch(us_stocks, asset_type='STOCK', chunk_size=50, max_workers=2)
 
     print("🇺🇸 미국 ETF 검색 중...")
     try:
         us_etfs = fdr.StockListing('ETF/US')
         if us_etfs.empty:
             raise ValueError("미국 ETF 리스트가 비어 있습니다.")
-        us_aligned_etfs = process_us_batch(us_etfs, asset_type='ETF', chunk_size=100, max_workers=5)
+        us_aligned_etfs = process_us_batch(us_etfs, asset_type='ETF', chunk_size=50, max_workers=2)
     except Exception as e:
         print(f"⚠ 미국 ETF 리스트 로드 실패: {e}")
         us_aligned_etfs = []
@@ -231,11 +259,11 @@ def main():
     message += ", ".join(kr_aligned_stocks) if kr_aligned_stocks else "포착된 종목이 없습니다."
     message += "\n\n"
 
-    message += "🇰🇷 **국내 ETF**\n"
+    message += "🇰🇷 **국내 ETF (시총 4천억 이상)**\n"
     message += ", ".join(kr_aligned_etfs) if kr_aligned_etfs else "포착된 종목이 없습니다."
     message += "\n\n"
 
-    message += "🇺🇸 **미국 주식 (시총 250억$ 이상)**\n"
+    message += "🇺🇸 **미국 주식 (S&P500 & 나스닥 상위 500 / 시총 250억$ 이상)**\n"
     message += ", ".join(us_aligned_stocks) if us_aligned_stocks else "포착된 종목이 없습니다."
     message += "\n\n"
 
