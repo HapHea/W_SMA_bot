@@ -106,10 +106,14 @@ def process_kr_asset(ticker, name):
 
 
 def run_kr_concurrent(items, max_workers=50):
-    """한국 주식/ETF 다중 처리"""
+    """한국 주식/ETF 다중 처리 (Code/Symbol 컬럼명 동적 대응)"""
     aligned_list = []
+
+    # 데이터프레임에 'Code' 컬럼이 있으면 'Code'를, 없으면 'Symbol'을 사용
+    ticker_col = 'Code' if 'Code' in items.columns else 'Symbol'
+
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(process_kr_asset, row['Code'], row['Name']) for _, row in items.iterrows()]
+        futures = [executor.submit(process_kr_asset, row[ticker_col], row['Name']) for _, row in items.iterrows()]
 
         for future in as_completed(futures):
             result = future.result()
