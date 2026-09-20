@@ -9,7 +9,9 @@ on:
 jobs:
   run-screener:
     runs-on: ubuntu-latest
-    
+    permissions:
+      contents: write # keepalive 액션이 더미 커밋을 남길 수 있도록 쓰기 권한 추가
+      
     steps:
     - name: Checkout repository
       uses: actions/checkout@v3
@@ -30,3 +32,6 @@ jobs:
         TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       run: python main.py
+
+    - name: Keepalive Workflow
+      uses: gautamkrishnar/keepalive-workflow@v2
