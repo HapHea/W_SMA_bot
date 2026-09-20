@@ -2,8 +2,8 @@ name: Weekly Stock Screener
 
 on:
   schedule:
-    # 매주 토요일 오후 1시 40분 (한국시간 기준) = UTC 기준 토요일 4시 40분
-    - cron: '40 4 * * 6'
+    # 매주 토요일 오전 11시 37분 (한국시간 기준) = UTC 기준 토요일 2시 37분
+    - cron: '37 2 * * 6'
   workflow_dispatch: # 버튼을 눌러 수동으로 실행할 수 있게 해주는 옵션
 
 jobs:
