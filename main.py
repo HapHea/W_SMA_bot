@@ -17,29 +17,26 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# 경고 메시지 숨김
 warnings.filterwarnings('ignore')
 
 # --- 텔레그램 설정 ---
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '8383235460:AAFAdBAFy5dUQE1wqkShqF3X8T9FbIaUJQc')
 CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '1729501017')
 
-# --- 통신 안정성 및 차단 방지 세션 설정 (User-Agent 추가) ---
+# --- 통신 안정성 및 차단 방지 세션 설정 ---
 session = requests.Session()
 session.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 })
 retry = Retry(connect=5, backoff_factor=1.0, status_forcelist=[429, 500, 502, 503, 504])
-adapter = HTTPAdapter(max_retries=retry, pool_connections=5, pool_maxsize=5)
+adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
 session.mount('http://', adapter)
 session.mount('https://', adapter)
 
 
 def send_telegram_message(message):
-    """텔레그램으로 메시지를 전송하는 함수 (4096자 초과 시 분할 전송)"""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     max_length = 4000
-
     try:
         for i in range(0, len(message), max_length):
             payload = {
@@ -53,12 +50,16 @@ def send_telegram_message(message):
         print(f"❌ 텔레그램 전송 실패: {e}")
 
 
-def check_ma_logic(df_ticker):
+def check_ma_logic(df_ticker, is_weekly_data=False):
     """(로컬 연산) 주봉 10, 20, 60 정배열 2주 내 진입 여부 판별"""
     try:
-        df_weekly = df_ticker.resample('W-FRI').agg({'Close': 'last'}).dropna()
+        # 미국 데이터는 이미 주봉으로 받으므로 resample 생략 (속도 향상)
+        if not is_weekly_data:
+            df_weekly = df_ticker.resample('W-FRI').agg({'Close': 'last'}).dropna()
+        else:
+            df_weekly = df_ticker.dropna()
 
-        if len(df_weekly) < 3:
+        if len(df_weekly) < 65: # 60주 이평선을 위해 최소 60개 이상 필요
             return False
 
         df_weekly['MA10'] = df_weekly['Close'].rolling(window=10).mean()
@@ -72,14 +73,11 @@ def check_ma_logic(df_ticker):
         if pd.isna(current['MA60']) or pd.isna(prev_1w['MA60']) or pd.isna(prev_2w['MA60']):
             return False
 
-        c_10, c_20, c_60 = current['MA10'], current['MA20'], current['MA60']
-        p1_10, p1_20, p1_60 = prev_1w['MA10'], prev_1w['MA20'], prev_1w['MA60']
-        p2_10, p2_20, p2_60 = prev_2w['MA10'], prev_2w['MA20'], prev_2w['MA60']
+        current_aligned = (current['MA10'] > current['MA20'] > current['MA60'])
+        prev_1w_aligned = (prev_1w['MA10'] > prev_1w['MA20'] > prev_1w['MA60'])
+        prev_2w_aligned = (prev_2w['MA10'] > prev_2w['MA20'] > prev_2w['MA60'])
 
-        current_aligned = (c_10 > c_20 > c_60)
-        prev_1w_aligned = (p1_10 > p1_20 > p1_60)
-        prev_2w_aligned = (p2_10 > p2_20 > p2_60)
-
+        # 이번 주에 정배열이 되었고, 과거 2주 중 하나라도 정배열이 아니었다면 True
         if current_aligned and (not prev_1w_aligned or not prev_2w_aligned):
             return True
 
@@ -89,9 +87,9 @@ def check_ma_logic(df_ticker):
 
 
 def process_kr_asset(ticker, name):
-    """한국 종목 개별 다운로드 및 이평선 검사"""
     try:
-        start_date = (datetime.datetime.now() - datetime.timedelta(days=730)).strftime('%Y-%m-%d')
+        # 최적화: 730일 -> 460일 (약 65주. 60주 이평선 계산에 충분한 기간)
+        start_date = (datetime.datetime.now() - datetime.timedelta(days=460)).strftime('%Y-%m-%d')
         df = fdr.DataReader(ticker, start_date)
 
         if df.empty or len(df) < 300 or 'Close' not in df.columns:
@@ -99,7 +97,7 @@ def process_kr_asset(ticker, name):
 
         df_ticker = df[['Close']].copy()
 
-        if check_ma_logic(df_ticker):
+        if check_ma_logic(df_ticker, is_weekly_data=False):
             return f"{name}({ticker})"
 
     except Exception:
@@ -108,13 +106,11 @@ def process_kr_asset(ticker, name):
 
 
 def run_kr_concurrent(items, max_workers=10):
-    """한국 주식/ETF 다중 처리"""
     aligned_list = []
     ticker_col = 'Code' if 'Code' in items.columns else 'Symbol'
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(process_kr_asset, row[ticker_col], row['Name']) for _, row in items.iterrows()]
-
         for future in as_completed(futures):
             result = future.result()
             if result:
@@ -123,15 +119,12 @@ def run_kr_concurrent(items, max_workers=10):
 
 
 def get_filtered_kr_etfs(min_marcap_100m=4000):
-    """시가총액 4천억 이상 국내 ETF만 가져오기"""
     try:
         url = "https://finance.naver.com/api/sise/etfItemList.nhn"
         response = session.get(url, timeout=10)
         data = response.json()
         
-        etf_list = data['result']['etfItemList']
-        df = pd.DataFrame(etf_list)
-        
+        df = pd.DataFrame(data['result']['etfItemList'])
         df_filtered = df[df['marketSum'] >= min_marcap_100m]
         df_filtered = df_filtered.rename(columns={'itemcode': 'Symbol', 'itemname': 'Name'})
         
@@ -143,9 +136,9 @@ def get_filtered_kr_etfs(min_marcap_100m=4000):
 
 
 def check_us_market_cap(ticker, name, asset_type):
-    """정배열을 통과한 종목에 한하여 API를 통해 시가총액/AUM 검사"""
     try:
-        time.sleep(random.uniform(0.5, 1.0))
+        # 최적화: 딜레이 시간 대폭 축소 (0.5~1.0 -> 0.1)
+        time.sleep(0.1) 
         
         ticker_obj = yf.Ticker(ticker, session=session)
         if asset_type == 'STOCK':
@@ -160,8 +153,7 @@ def check_us_market_cap(ticker, name, asset_type):
     return None
 
 
-def process_us_batch(items, asset_type, chunk_size=50, max_workers=2):
-    """미국 종목: 대량 다운로드 (threads=False로 429 차단 방지) -> 이평선 검사 -> 시가총액 검사"""
+def process_us_batch(items, asset_type, chunk_size=200, max_workers=4): # 최적화: chunk_size 200으로 확대
     passed_ma_tickers = []
     symbol_name_map = dict(zip(items['Symbol'], items['Name']))
     symbols = list(items['Symbol'].unique())
@@ -170,8 +162,10 @@ def process_us_batch(items, asset_type, chunk_size=50, max_workers=2):
         chunk = symbols[i:i + chunk_size]
         print(f"    📥 데이터 다운로드 및 분석 중... ({i + 1} ~ {min(i + chunk_size, len(symbols))} / {len(symbols)})")
 
-        time.sleep(2) # 서버 부하 방지용 대기
-        df_all = yf.download(chunk, period='2y', progress=False, session=session, threads=False)
+        time.sleep(1) # 청크 간 1초 대기
+
+        # 최적화: interval='1wk' 추가 (주봉 다이렉트 다운로드), period='2y' 유지
+        df_all = yf.download(chunk, period='2y', interval='1wk', progress=False, session=session, threads=False)
 
         if df_all.empty:
             continue
@@ -187,14 +181,15 @@ def process_us_batch(items, asset_type, chunk_size=50, max_workers=2):
                     df_ticker.columns = ['Close']
                     df_ticker.dropna(inplace=True)
 
-                    if len(df_ticker) >= 300 and check_ma_logic(df_ticker):
+                    # 최적화: is_weekly_data=True로 전달
+                    if len(df_ticker) >= 65 and check_ma_logic(df_ticker, is_weekly_data=True):
                         passed_ma_tickers.append(ticker)
         else:
             if 'Close' in df_all.columns:
                 df_ticker = df_all[['Close']].copy()
                 df_ticker.dropna(inplace=True)
 
-                if len(df_ticker) >= 300 and check_ma_logic(df_ticker):
+                if len(df_ticker) >= 65 and check_ma_logic(df_ticker, is_weekly_data=True):
                     passed_ma_tickers.append(chunk[0])
 
     print(f"    🎯 정배열 통과 종목 ({len(passed_ma_tickers)}개). 시가총액/AUM 필터링 시작...")
@@ -235,20 +230,19 @@ def main():
     sp500 = fdr.StockListing('S&P500')
     nasdaq = fdr.StockListing('NASDAQ')
     
-    # 나스닥은 시가총액 정보가 있는 경우 정렬 후 상위 500개 추출 (없으면 상위 500개 슬라이스)
     if 'Marcap' in nasdaq.columns:
         nasdaq = nasdaq.sort_values(by='Marcap', ascending=False)
     nasdaq_top500 = nasdaq.head(500)
 
     us_stocks = pd.concat([sp500, nasdaq_top500]).drop_duplicates(subset='Symbol')
-    us_aligned_stocks = process_us_batch(us_stocks, asset_type='STOCK', chunk_size=50, max_workers=2)
+    us_aligned_stocks = process_us_batch(us_stocks, asset_type='STOCK', chunk_size=200, max_workers=4)
 
     print("🇺🇸 미국 ETF 검색 중...")
     try:
         us_etfs = fdr.StockListing('ETF/US')
         if us_etfs.empty:
             raise ValueError("미국 ETF 리스트가 비어 있습니다.")
-        us_aligned_etfs = process_us_batch(us_etfs, asset_type='ETF', chunk_size=50, max_workers=2)
+        us_aligned_etfs = process_us_batch(us_etfs, asset_type='ETF', chunk_size=200, max_workers=4)
     except Exception as e:
         print(f"⚠ 미국 ETF 리스트 로드 실패: {e}")
         us_aligned_etfs = []
